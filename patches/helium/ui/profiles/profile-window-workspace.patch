@@ -41,7 +41,7 @@
  #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
  #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
  #include "chrome/browser/ui/dialogs/browser_dialogs.h"
-@@ -89,7 +98,9 @@
+@@ -88,7 +97,9 @@
  #include "components/sync/service/sync_service.h"
  #include "components/user_education/common/new_badge/new_badge_controller.h"
  #include "components/vector_icons/vector_icons.h"
@@ -51,7 +51,7 @@
  #include "ui/base/models/image_model.h"
  #include "ui/base/ui_base_features.h"
  #include "ui/color/color_id.h"
-@@ -120,6 +131,152 @@
+@@ -119,6 +130,152 @@
  #endif
  
  namespace {
@@ -204,7 +204,7 @@
  
  std::u16string GetSyncErrorButtonText(
      Profile* profile,
-@@ -436,6 +593,11 @@
+@@ -435,6 +592,11 @@
  
    if (!web_app::AppBrowserController::IsWebApp(&browser())) {
      GetWidget()->CloseWithReason(views::Widget::ClosedReason::kUnspecified);
@@ -237,10 +237,11 @@
  #include "chrome/test/user_education/interactive_feature_promo_test.h"
  #include "components/autofill/core/common/autofill_payments_features.h"
  #include "components/bookmarks/browser/bookmark_model.h"
-@@ -2888,3 +2890,128 @@
+@@ -2886,3 +2888,129 @@
+       ProfileMenuViewBase::ActionableItem::kHistorySyncButton,
        /*expected_bucket_count=*/1);
  }
- 
++
 +
 +// Real browser/profile integration tests for the personal-fork workspace swap.
 +// These require the compiled browser_tests target, not a mock BrowserWindow.
