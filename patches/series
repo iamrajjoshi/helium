@@ -368,3 +368,6 @@ helium/ui/compact-debugger-warning.patch
 helium/ui/progress-bar.patch
 helium/ui/exclusive-access-bubble.patch
 helium/ui/hide-page-actions-flag.patch
+helium/ui/little-arc.patch
+helium/ui/profiles/profile-window-workspace.patch
+helium/ui/github-live-folder.patch
