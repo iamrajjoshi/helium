@@ -1,0 +1,604 @@
+# Opt-in native macOS external-link previews with same-profile promotion.
+# Requires the preceding Helium patches; based on Chromium 156.0.8078.47.
+# Modified portions are licensed under GPL-3.0; original Chromium code
+# retains its BSD-style license. Browser tests are included, not run here.
+
+--- a/chrome/browser/about_flags.cc
++++ b/chrome/browser/about_flags.cc
+@@ -5213,6 +5213,11 @@
+ #include "chrome/browser/ungoogled_platform_flag_choices.h"
+ #include "chrome/browser/existing_switch_flag_choices.h"
+ const FeatureEntry kFeatureEntries[] = {
++    {"helium-little-arc", "Little Arc",
++     "Open external HTTP and HTTPS links in a small window on macOS. "
++     "Press Command+Shift+Return to move the page into a normal window "
++     "without changing its profile or reloading it.",
++     kOsMac, FEATURE_VALUE_TYPE(features::kHeliumLittleArc)},
+ #include "chrome/browser/helium_flag_entries.h"
+ #include "chrome/browser/ungoogled_flag_entries.h"
+ #include "chrome/browser/bromite_flag_entries.h"
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -2078,6 +2078,9 @@
+     }
+   }
+ 
++  for (auto& tab : startupTabs) {
++    tab.is_external_url_event = true;
++  }
+   if (!startupTabs.empty()) {
+     [self openStartupTabsReplacingNTP:std::move(startupTabs)];
+   }
+@@ -2641,7 +2644,7 @@
+   [AppController.sharedController setLastProfile:profile];
+ }
+ 
+-void OpenStartupTabsInBrowserWithProfile(const StartupTabs& tabs,
++void OpenStartupTabsInBrowserWithProfile(const StartupTabs& requested_tabs,
+                                          Profile* profile) {
+   if (!profile)
+     return;  // No suitable profile to open the URLs, do nothing.
+@@ -2650,6 +2653,21 @@
+     profile = ProfileManager::MaybeForceOffTheRecordMode(
+         profile->GetOriginalProfile());
+   }
++  // Only native external URL events are eligible. Handoff, open-file, normal
++  // startup, restore, and internal navigation retain their existing paths.
++  // Keep failed/unsupported opens in the original path so no URL is dropped.
++  StartupTabs tabs;
++  for (const auto& tab : requested_tabs) {
++    if (tab.is_external_url_event &&
++        chrome::OpenLittleArc(profile, tab.url, tab.is_untrusted_launch)) {
++      continue;
++    }
++    tabs.push_back(tab);
++  }
++  if (tabs.empty()) {
++    return;
++  }
++
+   // Use FindTabbedBrowser() to ensure URLs open in a normal tabbed browser
+   // window, not in PWA/app windows which cannot accept new tabs.
+   BrowserWindowInterface* browser =
+--- a/chrome/browser/app_controller_mac_browsertest.mm
++++ b/chrome/browser/app_controller_mac_browsertest.mm
+@@ -56,6 +56,7 @@
+ #include "chrome/browser/profiles/profile_test_util.h"
+ #include "chrome/browser/shortcuts/chrome_webloc_file.h"
+ #include "chrome/browser/signin/signin_util.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+@@ -804,6 +805,116 @@
+           ->GetLastCommittedURL());
+ }
+ 
++
++class AppControllerLittleArcBrowserTest : public InProcessBrowserTest {
++ public:
++  AppControllerLittleArcBrowserTest() {
++    feature_list_.InitAndEnableFeature(features::kHeliumLittleArc);
++  }
++
++  void SetUpOnMainThread() override {
++    ASSERT_TRUE(embedded_test_server()->Start());
++    std::ignore = AppController.sharedController;
++    [AppController.sharedController setLastProfile:browser()->GetProfile()];
++  }
++
++ private:
++  base::test::ScopedFeatureList feature_list_;
++};
++
++IN_PROC_BROWSER_TEST_F(AppControllerLittleArcBrowserTest,
++                       ExternalWebUrlUsesSameProfilePreview) {
++  const GURL url = embedded_test_server()->GetURL("/title1.html");
++  const size_t windows = GlobalBrowserCollection::GetInstance()->GetSize();
++  const int tabs = browser()->GetTabStripModel()->count();
++  SendOpenUrlToAppController(url);
++  ASSERT_TRUE(base::test::RunUntil([&]() {
++    BrowserWindowInterface* active =
++        GlobalBrowserCollection::GetInstance()->GetLastActiveBrowser();
++    return GlobalBrowserCollection::GetInstance()->GetSize() == windows + 1 &&
++           active && active->GetType() == BrowserWindowInterface::TYPE_POPUP;
++  }));
++  BrowserWindowInterface* popup =
++      GlobalBrowserCollection::GetInstance()->GetLastActiveBrowser();
++  ASSERT_TRUE(popup);
++  ASSERT_EQ(BrowserWindowInterface::TYPE_POPUP, popup->GetType());
++  EXPECT_EQ(browser()->GetProfile(), popup->GetProfile());
++  EXPECT_EQ(tabs, browser()->GetTabStripModel()->count());
++  content::WebContents* contents =
++      popup->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  EXPECT_EQ(url, contents->GetLastCommittedURL());
++  chrome::ExecuteCommand(popup, IDC_SHOW_AS_TAB);
++  EXPECT_EQ(contents, browser()->GetTabStripModel()->GetActiveWebContents());
++}
++
++IN_PROC_BROWSER_TEST_F(AppControllerLittleArcBrowserTest,
++                       InternalUrlKeepsNormalOpenPath) {
++  const size_t windows = GlobalBrowserCollection::GetInstance()->GetSize();
++  const GURL url("chrome://version/");
++  SendOpenUrlToAppController(url);
++  ASSERT_TRUE(base::test::RunUntil([&]() {
++    return browser()->GetTabStripModel()->GetActiveWebContents()
++               ->GetLastCommittedURL() == url;
++  }));
++  EXPECT_EQ(windows, GlobalBrowserCollection::GetInstance()->GetSize());
++}
++
++
++IN_PROC_BROWSER_TEST_F(AppControllerLittleArcBrowserTest,
++                       ExternalUrlDoesNotCrossProfiles) {
++  ProfileManager* manager = g_browser_process->profile_manager();
++  Profile& other_profile = profiles::testing::CreateProfileSync(
++      manager, manager->GenerateNextProfileDirectoryPath());
++  BrowserWindowInterface* other_browser = CreateBrowser(&other_profile);
++  [AppController.sharedController setLastProfile:&other_profile];
++  const int original_tabs = browser()->GetTabStripModel()->count();
++  SendOpenUrlToAppController(
++      embedded_test_server()->GetURL("/title1.html"));
++  BrowserWindowInterface* popup = nullptr;
++  ASSERT_TRUE(base::test::RunUntil([&]() {
++    popup = GlobalBrowserCollection::GetInstance()->GetLastActiveBrowser();
++    return popup && popup->GetType() == BrowserWindowInterface::TYPE_POPUP &&
++           popup->GetProfile() == &other_profile;
++  }));
++  content::WebContents* contents =
++      popup->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  chrome::ExecuteCommand(popup, IDC_SHOW_AS_TAB);
++  EXPECT_EQ(contents, other_browser->GetTabStripModel()->GetActiveWebContents());
++  EXPECT_EQ(original_tabs, browser()->GetTabStripModel()->count());
++}
++
++class AppControllerLittleArcStartupBrowserTest
++    : public AppControllerOpenShortcutBrowserTest {
++ public:
++  AppControllerLittleArcStartupBrowserTest() {
++    feature_list_.InitAndEnableFeature(features::kHeliumLittleArc);
++  }
++
++ private:
++  base::test::ScopedFeatureList feature_list_;
++};
++
++IN_PROC_BROWSER_TEST_F(AppControllerLittleArcStartupBrowserTest,
++                       DeferredExternalEventKeepsPreviewProvenance) {
++  BrowserWindowInterface* popup = nullptr;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&](BrowserWindowInterface* candidate) {
++        if (candidate->GetType() == BrowserWindowInterface::TYPE_POPUP) {
++          popup = candidate;
++          return false;
++        }
++        return true;
++      });
++  ASSERT_TRUE(popup);
++  EXPECT_EQ(browser()->GetProfile(), popup->GetProfile());
++  content::WebContents* contents =
++      popup->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  EXPECT_EQ(g_open_shortcut_url, contents->GetLastCommittedURL());
++}
++
+ class AppControllerReplaceNTPBrowserTest : public InProcessBrowserTest {
+  protected:
+   AppControllerReplaceNTPBrowserTest() = default;
+--- a/chrome/browser/browser_features.cc
++++ b/chrome/browser/browser_features.cc
+@@ -58,6 +58,9 @@
+ #else
+ BASE_FEATURE(kCertVerificationNetworkTime, base::FEATURE_DISABLED_BY_DEFAULT);
+ #endif  // !BUILDFLAG(IS_CHROMEOS)
++
++// Opens external web links in a transient same-profile preview window.
++BASE_FEATURE(kHeliumLittleArc, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Killswitch that guards clearing all user data in the ProfileImpl destructor.
+ BASE_FEATURE(kClearUserDataUponProfileDestruction,
+--- a/chrome/browser/browser_features.h
++++ b/chrome/browser/browser_features.h
+@@ -39,6 +39,7 @@
+ BASE_DECLARE_FEATURE(kCertificateTransparencyAskBeforeEnabling);
+ BASE_DECLARE_FEATURE(kCertVerificationNetworkTime);
+ BASE_DECLARE_FEATURE(kClearUserDataUponProfileDestruction);
++BASE_DECLARE_FEATURE(kHeliumLittleArc);
+ BASE_DECLARE_FEATURE(kCustomizableBrowserShortcuts);
+ 
+ #if BUILDFLAG(IS_LINUX)
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -13,6 +13,7 @@
+ #include "base/no_destructor.h"
+ #include "build/buildflag.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/browser_features.h"
+ #import "chrome/browser/app_controller_mac.h"
+ #include "chrome/browser/ui/cocoa/accelerators_cocoa.h"
+ #include "chrome/browser/ui/tabs/features.h"
+@@ -159,6 +160,10 @@
+     });
+     // clang-format on
+ 
++    if (base::FeatureList::IsEnabled(features::kHeliumLittleArc)) {
++      keys.push_back({true, true, false, false, kVK_Return, IDC_SHOW_AS_TAB});
++    }
++
+     // Tab Group Shortcuts
+     keys.push_back(
+         {true, false, true, false, kVK_ANSI_C, IDC_ADD_NEW_TAB_TO_GROUP});
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -26,12 +26,14 @@
+ #include "base/metrics/user_metrics.h"
+ #include "base/strings/escape.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/supports_user_data.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
+ #include "chrome/browser/bookmarks/bookmark_model_factory.h"
++#include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/chrome_browsing_data_remover_delegate.h"
+ #include "chrome/browser/chained_back_navigation_tracker.h"
+@@ -140,6 +142,7 @@
+ #include "chrome/browser/web_applications/web_app_registrar.h"
+ #include "chrome/common/chrome_features.h"
+ #include "chrome/common/content_restriction.h"
++#include "chrome/common/chrome_switches.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/url_constants.h"
+ #include "chrome/common/webui_url_constants.h"
+@@ -218,6 +221,7 @@
+ #include "ui/base/models/list_selection_model.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
++#include "url/origin.h"
+ #include "ui/events/keycodes/keyboard_codes.h"
+ #include "url/gurl.h"
+ #include "url/url_constants.h"
+@@ -280,6 +284,11 @@
+ #endif
+ 
+ namespace {
++
++// Tag the live page, not its URL or profile: promotion must preserve this exact
++// WebContents, including forms, navigation history and the storage partition.
++const char kLittleArcContentsKey[] = "helium.little_arc";
++class LittleArcContentsData : public base::SupportsUserData::Data {};
+ 
+ const char kOsOverrideForTabletSite[] = "Linux; Android 9; Chrome tablet";
+ const char kChPlatformOverrideForTabletSite[] = "Android";
+@@ -2041,32 +2050,144 @@
+   return GetKeyboardFocusedTabIndex(browser).has_value();
+ }
+ 
++BrowserWindowInterface* OpenLittleArc(Profile* profile,
++                                     const GURL& url,
++                                     bool is_untrusted_launch) {
++  if (!base::FeatureList::IsEnabled(features::kHeliumLittleArc) || !profile ||
++      !url.is_valid() || !url.SchemeIsHTTPOrHTTPS() ||
++      base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kKioskMode) ||
++      GetBrowserWindowCreationStatusForProfile(*profile) !=
++          BrowserWindowInterface::CreationStatus::kOk) {
++    return nullptr;
++  }
++
++  BrowserWindowCreateParams create_params(
++      BrowserWindowInterface::TYPE_POPUP, *profile, true);
++  create_params.initial_bounds = gfx::Rect(720, 640);
++  create_params.initial_origin_specified =
++      BrowserWindowCreateParams::ValueSpecified::kUnspecified;
++  create_params.initial_show_state = ui::mojom::WindowShowState::kNormal;
++  create_params.omit_from_session_restore = true;
++  create_params.should_trigger_session_restore = false;
++  create_params.user_title = "Little Arc";
++  BrowserWindowInterface* popup = CreateBrowserWindow(std::move(create_params));
++  if (!popup) {
++    return nullptr;
++  }
++
++  base::WeakPtr<BrowserWindowInterface> popup_weak = popup->GetWeakPtr();
++  if (!popup_weak || popup_weak->IsDeleteScheduled()) {
++    return nullptr;
++  }
++  NavigateParams navigation(popup, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++  // CURRENT_TAB targets this empty popup rather than selecting a normal window.
++  navigation.disposition = WindowOpenDisposition::CURRENT_TAB;
++  if (is_untrusted_launch) {
++    navigation.initiator_origin = url::Origin();
++  }
++  Navigate(&navigation);
++  // Navigation and native window callbacks can close a window synchronously.
++  // A weak pointer can still be live after deletion has been scheduled.
++  if (!popup_weak || popup_weak->IsDeleteScheduled()) {
++    return nullptr;
++  }
++  content::WebContents* contents =
++      popup_weak->GetTabStripModel()->GetActiveWebContents();
++  if (!contents) {
++    popup_weak->GetWindow()->Close();
++    return nullptr;
++  }
++  contents->SetUserData(kLittleArcContentsKey,
++                        std::make_unique<LittleArcContentsData>());
++  popup_weak->GetWindow()->Show();
++  return popup_weak && !popup_weak->IsDeleteScheduled() ? popup_weak.get()
++                                                       : nullptr;
++}
++
+ void ConvertPopupToTabbedBrowser(BrowserWindowInterface* browser) {
+   base::RecordAction(UserMetricsAction("ShowAsTab"));
+   TabStripModel* tab_strip = browser->GetTabStripModel();
++  content::WebContents* active_contents = tab_strip->GetActiveWebContents();
++  if (!active_contents) {
++    return;
++  }
++  const bool is_little_arc =
++      active_contents->GetUserData(kLittleArcContentsKey) != nullptr;
++  base::WeakPtr<BrowserWindowInterface> source_weak = browser->GetWeakPtr();
++  base::WeakPtr<content::WebContents> contents_weak = active_contents->GetWeakPtr();
+   // If this popup is the last browser object, removing it from the browser-list
+   // will trigger OnShutdownStarting for Window close. Create the new browser
+   // object first, before removing the existing object from the browser-list in
+   // order to avoid incorrectly triggering a shutdown.
+-  BrowserWindowInterface* new_tabbed_browser =
+-      CreateBrowserWindow(BrowserWindowCreateParams(
+-          *browser->GetProfile(), /*from_user_gesture=*/true));
++  BrowserWindowInterface* new_tabbed_browser = nullptr;
++  if (is_little_arc) {
++    // Never match original profiles: an incognito/isolated preview must not
++    // move into a regular window, or into a different profile's workspace.
++    new_tabbed_browser =
++        ProfileBrowserCollection::GetForProfile(browser->GetProfile())
++            ->FindTabbedBrowser(/*match_original_profiles=*/false);
++  }
++  const bool creates_target = !new_tabbed_browser;
++  if (creates_target) {
++    new_tabbed_browser = CreateBrowserWindow(BrowserWindowCreateParams(
++        *browser->GetProfile(), /*from_user_gesture=*/true));
++  }
++  if (!new_tabbed_browser) {
++    return;
++  }
++  base::WeakPtr<BrowserWindowInterface> target_weak =
++      new_tabbed_browser->GetWeakPtr();
++  // Creating the destination may dispatch native callbacks. Do not detach a
++  // different tab, use a closing window, or retain raw pointers across them.
++  if (!source_weak || source_weak->IsDeleteScheduled() || !contents_weak ||
++      source_weak->GetTabStripModel()->GetActiveWebContents() !=
++          contents_weak.get() ||
++      !target_weak || target_weak->IsDeleteScheduled()) {
++    if (creates_target && target_weak && !target_weak->IsDeleteScheduled() &&
++        target_weak->GetTabStripModel()->empty()) {
++      target_weak->GetWindow()->Close();
++    }
++    return;
++  }
++  CHECK_EQ(target_weak->GetProfile(), source_weak->GetProfile());
++  contents_weak->RemoveUserData(kLittleArcContentsKey);
+   // This method moves a WebContents from a non-normal browser window to a
+   // normal browser window. We cannot move the Tab over directly since TabModel
+   // enforces the requirement that it cannot move between window types.
+   // https://crbug.com/334281979): Non-normal browser windows should not have a
+   // tab to begin with.
++  tab_strip = source_weak->GetTabStripModel();
+   std::unique_ptr<content::WebContents> contents_move =
+       tab_strip->DetachWebContentsAtForInsertion(tab_strip->active_index());
+-
+-  // This method moves a WebContents from a non-normal browser window to a
+-  // normal browser window. We cannot move the Tab over directly since TabModel
+-  // enforces the requirement that it cannot move between window types.
+-  // https://crbug.com/334281979): Non-normal browser windows should not have a
+-  // tab to begin with.
+-  new_tabbed_browser->GetTabStripModel()->AppendWebContents(
+-      std::move(contents_move), true);
+-  new_tabbed_browser->GetWindow()->Show();
++  if (!contents_move) {
++    return;
++  }
++
++  // Detach observers can close the target as well as the now-empty popup.
++  // If that happened, recover into a new window of the contents' exact profile
++  // when creation is still allowed, never into an unrelated active browser.
++  if (!target_weak || target_weak->IsDeleteScheduled()) {
++    Profile* profile =
++        Profile::FromBrowserContext(contents_move->GetBrowserContext());
++    if (GetBrowserWindowCreationStatusForProfile(*profile) !=
++        BrowserWindowInterface::CreationStatus::kOk) {
++      return;
++    }
++    BrowserWindowInterface* replacement = CreateBrowserWindow(
++        BrowserWindowCreateParams(*profile, /*from_user_gesture=*/true));
++    if (!replacement) {
++      return;
++    }
++    target_weak = replacement->GetWeakPtr();
++    if (!target_weak || target_weak->IsDeleteScheduled()) {
++      return;
++    }
++  }
++  target_weak->GetTabStripModel()->AppendWebContents(std::move(contents_move),
++                                                   true);
++  if (target_weak && !target_weak->IsDeleteScheduled()) {
++    target_weak->GetWindow()->Show();
++  }
+ }
+ 
+ void CloseTabsToRight(BrowserWindowInterface* browser) {
+--- a/chrome/browser/ui/browser_commands.h
++++ b/chrome/browser/ui/browser_commands.h
+@@ -239,6 +239,12 @@
+ void PinKeyboardFocusedTab(BrowserWindowInterface* browser);
+ void GroupKeyboardFocusedTab(BrowserWindowInterface* browser);
+ void DuplicateKeyboardFocusedTab(BrowserWindowInterface* browser);
++// Opens a transient HTTP(S) popup using exactly `profile`. Returns nullptr if
++// disabled, unsupported, or a window cannot be created; callers must fall back.
++// Does not create/select a profile, register protocols, or change defaults.
++BrowserWindowInterface* OpenLittleArc(Profile* profile,
++                                     const GURL& url,
++                                     bool is_untrusted_launch);
+ void ConvertPopupToTabbedBrowser(BrowserWindowInterface* browser);
+ void CloseTabsToRight(BrowserWindowInterface* browser);
+ void CloseOtherTabs(BrowserWindowInterface* browser);
+--- a/chrome/browser/ui/browser_commands_browsertest.cc
++++ b/chrome/browser/ui/browser_commands_browsertest.cc
+@@ -11,14 +11,17 @@
+ #include "base/test/scoped_feature_list.h"
+ #include "build/branding_buildflags.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/browser_features.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/prefs/incognito_mode_prefs.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_init_state.h"
+ #include "chrome/browser/ui/browser_tabstrip.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/side_panel/side_panel_entry_id.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+@@ -779,6 +782,121 @@
+   EXPECT_EQ(false, browser_shutdown::HasShutdownStarted());
+ }
+ 
++
++class LittleArcBrowserTest : public InProcessBrowserTest {
++ public:
++  LittleArcBrowserTest() {
++    feature_list_.InitAndEnableFeature(features::kHeliumLittleArc);
++  }
++
++  void SetUpOnMainThread() override {
++    ASSERT_TRUE(embedded_test_server()->Start());
++  }
++
++ private:
++  base::test::ScopedFeatureList feature_list_;
++};
++
++IN_PROC_BROWSER_TEST_F(LittleArcBrowserTest, RejectsNonWebUrls) {
++  for (const char* url : {"chrome://settings/", "file:///tmp/preview.html",
++                          "javascript:alert(1)", "data:text/html,preview",
++                          "mailto:test@example.com", "not a valid URL"}) {
++    EXPECT_EQ(nullptr, OpenLittleArc(browser()->GetProfile(), GURL(url), false));
++  }
++}
++
++IN_PROC_BROWSER_TEST_F(LittleArcBrowserTest, PromotionPreservesPageAndProfile) {
++  const GURL url = embedded_test_server()->GetURL("/title1.html");
++  BrowserWindowInterface* popup =
++      OpenLittleArc(browser()->GetProfile(), url, false);
++  ASSERT_TRUE(popup);
++  EXPECT_EQ(BrowserWindowInterface::TYPE_POPUP, popup->GetType());
++  EXPECT_EQ(browser()->GetProfile(), popup->GetProfile());
++  EXPECT_TRUE(BrowserInitState::From(popup)
++                  ->create_params()
++                  .omit_from_session_restore);
++  EXPECT_FALSE(BrowserInitState::From(popup)
++                   ->create_params()
++                   .should_trigger_session_restore);
++  content::WebContents* contents =
++      popup->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  EXPECT_EQ(url, contents->GetLastCommittedURL());
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(
++      popup, embedded_test_server()->GetURL("/title2.html")));
++  ASSERT_TRUE(content::ExecJs(contents,
++      "window.littleArcState = 'retained';"
++      "document.cookie = 'little_arc_cookie=present; path=/';"));
++  const int history_count = contents->GetController().GetEntryCount();
++
++  // The preview shares the resolved profile's cookies, not a fresh profile.
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), url));
++  EXPECT_EQ(true, content::EvalJs(
++      browser()->GetTabStripModel()->GetActiveWebContents(),
++      "document.cookie.includes('little_arc_cookie=present')"));
++  const int target_count = browser()->GetTabStripModel()->count();
++  BrowserCommandsTest::ReloadObserver reload_observer;
++  reload_observer.SetWebContents(contents);
++  ConvertPopupToTabbedBrowser(popup);
++  EXPECT_EQ(target_count + 1, browser()->GetTabStripModel()->count());
++  EXPECT_EQ(contents, browser()->GetTabStripModel()->GetActiveWebContents());
++  EXPECT_EQ("retained", content::EvalJs(contents, "window.littleArcState"));
++  EXPECT_EQ(history_count, contents->GetController().GetEntryCount());
++  EXPECT_EQ(0, reload_observer.load_count());
++}
++
++IN_PROC_BROWSER_TEST_F(LittleArcBrowserTest, PromotionStaysOffTheRecord) {
++  BrowserWindowInterface* incognito = CreateIncognitoBrowser();
++  const int regular_count = browser()->GetTabStripModel()->count();
++  BrowserWindowInterface* popup = OpenLittleArc(
++      incognito->GetProfile(), embedded_test_server()->GetURL("/title1.html"),
++      false);
++  ASSERT_TRUE(popup);
++  content::WebContents* contents =
++      popup->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  ConvertPopupToTabbedBrowser(popup);
++  EXPECT_EQ(contents, incognito->GetTabStripModel()->GetActiveWebContents());
++  EXPECT_EQ(incognito->GetProfile(), contents->GetBrowserContext());
++  EXPECT_TRUE(incognito->GetProfile()->IsOffTheRecord());
++  EXPECT_EQ(regular_count, browser()->GetTabStripModel()->count());
++}
++
++IN_PROC_BROWSER_TEST_F(LittleArcBrowserTest, PromotionCreatesWindowIfNeeded) {
++  Profile* profile = browser()->GetProfile();
++  BrowserWindowInterface* popup = OpenLittleArc(
++      profile, embedded_test_server()->GetURL("/title1.html"), false);
++  ASSERT_TRUE(popup);
++  content::WebContents* contents =
++      popup->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(content::WaitForLoadStop(contents));
++  browser()->GetTabStripModel()->CloseAllTabs();
++  ConvertPopupToTabbedBrowser(popup);
++  BrowserWindowInterface* target =
++      ProfileBrowserCollection::GetForProfile(profile)->FindTabbedBrowser();
++  ASSERT_TRUE(target);
++  EXPECT_EQ(profile, target->GetProfile());
++  EXPECT_EQ(contents, target->GetTabStripModel()->GetActiveWebContents());
++  EXPECT_FALSE(browser_shutdown::HasShutdownStarted());
++}
++
++class LittleArcDisabledBrowserTest : public InProcessBrowserTest {
++ public:
++  LittleArcDisabledBrowserTest() {
++    feature_list_.InitAndDisableFeature(features::kHeliumLittleArc);
++  }
++
++ private:
++  base::test::ScopedFeatureList feature_list_;
++};
++
++IN_PROC_BROWSER_TEST_F(LittleArcDisabledBrowserTest, DoesNotCreatePreview) {
++  const size_t count = GlobalBrowserCollection::GetInstance()->GetSize();
++  EXPECT_EQ(nullptr, OpenLittleArc(browser()->GetProfile(),
++                                  GURL("https://example.com/"), false));
++  EXPECT_EQ(count, GlobalBrowserCollection::GetInstance()->GetSize());
++}
++
+ IN_PROC_BROWSER_TEST_F(BrowserCommandsTest, AddingToReadingListOpensToast) {
+   GURL main_url(https_server_.GetURL("a.test", "/iframe.html"));
+   ASSERT_TRUE(ui_test_utils::NavigateToURL(browser(), main_url));
+--- a/chrome/browser/ui/startup/startup_tab.h
++++ b/chrome/browser/ui/startup/startup_tab.h
+@@ -31,6 +31,10 @@
+   // True if this tab was launched from an untrusted external custom protocol
+   // (e.g., google-chrome://) that was stripped on startup.
+   bool is_untrusted_launch = false;
++
++  // Set only by the macOS external URL event handler. This survives deferred
++  // startup and profile loading without changing ordinary startup/restore tabs.
++  bool is_external_url_event = false;
+ };
+ 
+ using StartupTabs = std::vector<StartupTab>;
