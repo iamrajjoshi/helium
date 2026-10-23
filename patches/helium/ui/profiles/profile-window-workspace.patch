@@ -1,0 +1,402 @@
+# Experimental profile-owned window switching; no tab/storage transplantation.
+# Apply after helium/ui/little-arc.patch. Native browser tests are not run here.
+# Modified portions: GPL-3.0; original Chromium code retains its license.
+
+--- a/chrome/browser/ui/views/profiles/profile_menu_view.cc
++++ b/chrome/browser/ui/views/profiles/profile_menu_view.cc
+@@ -8,20 +8,27 @@
+ #include <optional>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include "ash/constants/web_app_id_constants.h"
+ #include "base/feature_list.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "base/metrics/histogram_functions.h"
++#include "base/no_destructor.h"
++#include "base/scoped_observation.h"
+ #include "base/notreached.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/enterprise/browser_management/browser_management_service.h"
+ #include "chrome/browser/enterprise/browser_management/management_service_factory.h"
+ #include "chrome/browser/enterprise/util/managed_browser_utils.h"
+@@ -47,6 +54,8 @@
+ #include "chrome/browser/sync/sync_service_factory.h"
+ #include "chrome/browser/sync/sync_ui_util.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection_observer.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/dialogs/browser_dialogs.h"
+@@ -89,7 +98,9 @@
+ #include "components/sync/service/sync_service.h"
+ #include "components/user_education/common/new_badge/new_badge_controller.h"
+ #include "components/vector_icons/vector_icons.h"
++#include "ui/base/base_window.h"
+ #include "ui/base/l10n/l10n_util.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/base/models/image_model.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/color/color_id.h"
+@@ -120,6 +131,152 @@
+ #endif
+ 
+ namespace {
++
++// Personal-fork workspace switching. Browser windows and their WebContents
++// always retain their original Profile; no storage or tabs cross profiles.
++class ProfileWindowWorkspace : public BrowserCollectionObserver {
++ public:
++  static ProfileWindowWorkspace& Get() {
++    static base::NoDestructor<ProfileWindowWorkspace> instance;
++    return *instance;
++  }
++
++  void SwitchProfile(BrowserWindowInterface& source,
++                     const base::FilePath& path) {
++    if (!observation_.IsObserving()) {
++      observation_.Observe(GlobalBrowserCollection::GetInstance());
++    }
++    const unsigned request = ++request_;
++    profiles::LoadProfileAsync(
++        path, base::BindOnce(&ProfileWindowWorkspace::OnProfileLoaded,
++                            base::Unretained(this), request, source.GetWeakPtr(),
++                            source.GetWindow()->GetRestoredBounds(),
++                            source.GetWindow()->IsMaximized()));
++  }
++
++  void OnBrowserClosed(BrowserWindowInterface* browser) override {
++    // The collection removes the closing browser before notifying observers.
++    // Detach before its owning browser-process features are destroyed, and
++    // allow a later browser-process/test instance to attach afresh.
++    if (GlobalBrowserCollection::GetInstance()->IsEmpty()) {
++      ++request_;
++      active_ = nullptr;
++      hidden_.clear();
++      observation_.Reset();
++      return;
++    }
++    RemoveHidden(browser);
++    if (active_ != browser) {
++      return;
++    }
++    active_ = nullptr;
++    // Quitting must close all profiles, not resurrect hidden windows.
++    if (browser_shutdown::IsTryingToQuit()) {
++      hidden_.clear();
++      return;
++    }
++    while (!hidden_.empty()) {
++      auto previous = hidden_.back();
++      hidden_.pop_back();
++      if (previous && !previous->IsDeleteScheduled() && previous->GetWindow()) {
++        active_ = previous.get();
++        previous->GetWindow()->Show();
++        return;
++      }
++    }
++  }
++
++ private:
++  friend class base::NoDestructor<ProfileWindowWorkspace>;
++  ProfileWindowWorkspace() = default;
++
++  void RemoveHidden(BrowserWindowInterface* browser) {
++    std::erase_if(hidden_, [browser](const auto& entry) {
++      return !entry || entry.get() == browser;
++    });
++  }
++
++  void OnProfileLoaded(unsigned request,
++                       base::WeakPtr<BrowserWindowInterface> source,
++                       const gfx::Rect& bounds,
++                       bool maximized,
++                       Profile* profile) {
++    // Check before the helper activates/creates a window, not just afterward:
++    // a late profile load must not steal focus from a newer selection.
++    if (request != request_ || !source || source->IsDeleteScheduled() ||
++        !profile || browser_shutdown::IsTryingToQuit()) {
++      return;
++    }
++    profiles::OpenBrowserWindowForProfile(
++        base::BindOnce(&ProfileWindowWorkspace::CompleteSwitch,
++                       base::Unretained(this), request, source, bounds, maximized),
++        /*always_create=*/false, /*is_new_profile=*/false,
++        /*open_command_line_urls=*/false, profile);
++  }
++
++  void CompleteSwitch(unsigned request,
++                      base::WeakPtr<BrowserWindowInterface> source,
++                      const gfx::Rect& bounds,
++                      bool maximized,
++                      BrowserWindowInterface* target) {
++    auto target_weak = target ? target->GetWeakPtr()
++                              : base::WeakPtr<BrowserWindowInterface>();
++    // Native Show/Restore/resize can reenter and close either window. Never
++    // carry raw window pointers across those calls.
++    const auto windows_valid = [&] {
++      return request == request_ && source && target_weak &&
++             source.get() != target_weak.get() &&
++             !source->IsDeleteScheduled() && !target_weak->IsDeleteScheduled() &&
++             !browser_shutdown::IsTryingToQuit() && source->GetWindow() &&
++             target_weak->GetWindow();
++    };
++    if (!windows_valid()) {
++      return;
++    }
++    // Native fullscreen/Spaces transitions cannot safely be imitated with
++    // bounds. Preserve Chromium's ordinary switch behavior in that case.
++    if (source->GetWindow()->IsFullscreen() ||
++        target_weak->GetWindow()->IsFullscreen()) {
++      target_weak->GetWindow()->Show();
++      return;
++    }
++    target_weak->GetWindow()->Restore();
++    if (!windows_valid()) {
++      return;
++    }
++    target_weak->GetWindow()->SetBounds(bounds);
++    if (!windows_valid()) {
++      return;
++    }
++    if (maximized) {
++      target_weak->GetWindow()->Maximize();
++      if (!windows_valid()) {
++        return;
++      }
++    }
++    // Show may defer for initial WebUI paint. Keep the source visible in that
++    // case rather than leaving the user without any visible browser window.
++    target_weak->GetWindow()->Show();
++    if (!windows_valid() || !target_weak->GetWindow()->IsVisible()) {
++      return;
++    }
++    RemoveHidden(target_weak.get());
++    RemoveHidden(source.get());
++    hidden_.push_back(source);
++    active_ = target_weak.get();
++    source->GetWindow()->Hide();
++    if (source && source->GetWindow() && source->GetWindow()->IsVisible()) {
++      RemoveHidden(source.get());
++    }
++  }
++
++  unsigned request_ = 0;
++  raw_ptr<BrowserWindowInterface> active_ = nullptr;
++  std::vector<base::WeakPtr<BrowserWindowInterface>> hidden_;
++  base::ScopedObservation<GlobalBrowserCollection, BrowserCollectionObserver>
++      observation_{this};
++};
++
+ 
+ std::u16string GetSyncErrorButtonText(
+     Profile* profile,
+@@ -436,6 +593,11 @@
+ 
+   if (!web_app::AppBrowserController::IsWebApp(&browser())) {
+     GetWidget()->CloseWithReason(views::Widget::ClosedReason::kUnspecified);
++    if (base::FeatureList::IsEnabled(features::kHeliumProfileWindowSwitching) &&
++        !profile().IsOffTheRecord() && !profile().IsGuestSession()) {
++      ProfileWindowWorkspace::Get().SwitchProfile(browser(), profile_path);
++      return;
++    }
+     // Switch to the selected profile and launch a HaTS survey for the
+     // associated non-webapp browser.
+     profiles::SwitchToProfile(
+--- a/chrome/browser/ui/views/profiles/profile_menu_view.h
++++ b/chrome/browser/ui/views/profiles/profile_menu_view.h
+@@ -61,6 +61,7 @@
+   }
+ 
+  private:
++  friend class ProfileMenuViewWorkspaceTest;
+   friend class ProfileMenuViewExtensionsTest;
+   friend class ProfileMenuViewSigninPendingTest;
+   friend class ProfileMenuViewSignoutTest;
+--- a/chrome/browser/ui/views/profiles/profile_menu_view_browsertest.cc
++++ b/chrome/browser/ui/views/profiles/profile_menu_view_browsertest.cc
+@@ -98,6 +98,8 @@
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/test/base/in_process_browser_test.h"
+ #include "chrome/test/base/ui_test_utils.h"
++#include "content/public/test/browser_test_utils.h"
++#include "ui/base/base_window.h"
+ #include "chrome/test/user_education/interactive_feature_promo_test.h"
+ #include "components/autofill/core/common/autofill_payments_features.h"
+ #include "components/bookmarks/browser/bookmark_model.h"
+@@ -2888,3 +2890,128 @@
+       /*expected_bucket_count=*/1);
+ }
+ 
++
++// Real browser/profile integration tests for the personal-fork workspace swap.
++// These require the compiled browser_tests target, not a mock BrowserWindow.
++class ProfileMenuViewWorkspaceTest : public ProfileMenuViewBrowserTest {
++ public:
++  ProfileMenuViewWorkspaceTest() {
++    features_.InitFromCommandLine("HeliumProfileWindowSwitching", "");
++  }
++
++ protected:
++  void SelectProfile(BrowserWindowInterface* from, Profile* to) {
++    SetTargetBrowser(from);
++    OpenProfileMenu(from);
++    auto* menu = static_cast<ProfileMenuView*>(profile_menu_view());
++    ASSERT_TRUE(menu);
++    menu->set_skip_window_active_check_for_testing(true);
++    menu->OnOtherProfileSelected(to->GetPath());
++  }
++
++ private:
++  base::test::ScopedFeatureList features_;
++};
++
++IN_PROC_BROWSER_TEST_F(ProfileMenuViewWorkspaceTest,
++                       KeepsStorageAndLiveTabsIsolated) {
++  ASSERT_TRUE(embedded_test_server()->Start());
++  const GURL url = embedded_test_server()->GetURL("/title1.html");
++  auto* first = browser();
++  Profile* second_profile = CreateAdditionalProfile();
++  auto* second = CreateBrowser(second_profile);
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(first, url));
++  ASSERT_TRUE(ui_test_utils::NavigateToURL(second, url));
++  auto* first_tab = first->GetTabStripModel()->GetActiveWebContents();
++  auto* second_tab = second->GetTabStripModel()->GetActiveWebContents();
++  ASSERT_TRUE(content::ExecJs(first_tab,
++      "document.cookie='workspace=first';localStorage.key='first';"
++      "window.unsaved='first draft'"));
++  ASSERT_TRUE(content::ExecJs(second_tab,
++      "document.cookie='workspace=second';localStorage.key='second';"
++      "window.unsaved='second draft'"));
++  first->GetWindow()->Restore();
++  first->GetWindow()->SetBounds(gfx::Rect(100, 100, 900, 700));
++  first->GetWindow()->Show();
++  const gfx::Rect bounds = first->GetWindow()->GetRestoredBounds();
++
++  for (int i = 0; i < 3; ++i) {
++    SelectProfile(first, second_profile);
++    ASSERT_TRUE(base::test::RunUntil([&] {
++      return !first->GetWindow()->IsVisible() &&
++             second->GetWindow()->IsVisible();
++    }));
++    EXPECT_EQ(bounds, second->GetWindow()->GetRestoredBounds());
++    EXPECT_EQ(second_profile, second->GetProfile());
++    EXPECT_EQ(second_tab, second->GetTabStripModel()->GetActiveWebContents());
++    EXPECT_EQ("workspace=second", content::EvalJs(second_tab, "document.cookie"));
++    EXPECT_EQ("second", content::EvalJs(second_tab, "localStorage.key"));
++    EXPECT_EQ("second draft", content::EvalJs(second_tab, "window.unsaved"));
++
++    SelectProfile(second, first->GetProfile());
++    ASSERT_TRUE(base::test::RunUntil([&] {
++      return first->GetWindow()->IsVisible() &&
++             !second->GetWindow()->IsVisible();
++    }));
++    EXPECT_EQ(first_tab, first->GetTabStripModel()->GetActiveWebContents());
++    EXPECT_EQ("workspace=first", content::EvalJs(first_tab, "document.cookie"));
++    EXPECT_EQ("first", content::EvalJs(first_tab, "localStorage.key"));
++    EXPECT_EQ("first draft", content::EvalJs(first_tab, "window.unsaved"));
++  }
++  SelectProfile(first, second_profile);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return !first->GetWindow()->IsVisible(); }));
++  CloseBrowserSynchronously(second);
++  EXPECT_TRUE(first->GetWindow()->IsVisible());
++  SetTargetBrowser(first);
++}
++
++IN_PROC_BROWSER_TEST_F(ProfileMenuViewWorkspaceTest,
++                       CreatesTargetAndRestoresPreviousOnClose) {
++  auto* first = browser();
++  Profile* second_profile = CreateAdditionalProfile();
++  SelectProfile(first, second_profile);
++  BrowserWindowInterface* second = nullptr;
++  ASSERT_TRUE(base::test::RunUntil([&] {
++    second = ProfileBrowserCollection::GetForProfile(second_profile)
++                 ->FindTabbedBrowser(/*match_original_profiles=*/false);
++    return second && second->GetWindow()->IsVisible();
++  }));
++  // Initial WebUI paint can defer Show(). The safe first-open fallback leaves
++  // the source visible; selecting the now-ready target must swap it normally.
++  if (first->GetWindow()->IsVisible()) {
++    first->GetWindow()->Show();
++    SelectProfile(first, second_profile);
++  }
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return !first->GetWindow()->IsVisible(); }));
++  EXPECT_EQ(second_profile, second->GetProfile());
++  second->GetWindow()->Close();
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return first->GetWindow()->IsVisible(); }));
++  SetTargetBrowser(first);
++}
++
++IN_PROC_BROWSER_TEST_F(ProfileMenuViewWorkspaceTest,
++                       ThreeProfilesRestoreInOrderWithoutMovingTabs) {
++  auto* first = browser();
++  Profile* second_profile = CreateAdditionalProfile();
++  Profile* third_profile = CreateAdditionalProfile();
++  auto* second = CreateBrowser(second_profile);
++  auto* third = CreateBrowser(third_profile);
++  first->GetWindow()->Show();
++  SelectProfile(first, second_profile);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return !first->GetWindow()->IsVisible(); }));
++  SelectProfile(second, third_profile);
++  ASSERT_TRUE(base::test::RunUntil(
++      [&] { return !second->GetWindow()->IsVisible(); }));
++  EXPECT_EQ(second_profile, second->GetProfile());
++  EXPECT_EQ(third_profile, third->GetProfile());
++  CloseBrowserSynchronously(third);
++  EXPECT_TRUE(second->GetWindow()->IsVisible());
++  EXPECT_FALSE(first->GetWindow()->IsVisible());
++  CloseBrowserSynchronously(second);
++  EXPECT_TRUE(first->GetWindow()->IsVisible());
++  SetTargetBrowser(first);
++}
+--- a/chrome/browser/browser_features.cc
++++ b/chrome/browser/browser_features.cc
+@@ -61,6 +61,7 @@
+ 
+ // Opens external web links in a transient same-profile preview window.
+ BASE_FEATURE(kHeliumLittleArc, base::FEATURE_DISABLED_BY_DEFAULT);
++BASE_FEATURE(kHeliumProfileWindowSwitching, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Killswitch that guards clearing all user data in the ProfileImpl destructor.
+ BASE_FEATURE(kClearUserDataUponProfileDestruction,
+--- a/chrome/browser/browser_features.h
++++ b/chrome/browser/browser_features.h
+@@ -40,6 +40,7 @@
+ BASE_DECLARE_FEATURE(kCertVerificationNetworkTime);
+ BASE_DECLARE_FEATURE(kClearUserDataUponProfileDestruction);
+ BASE_DECLARE_FEATURE(kHeliumLittleArc);
++BASE_DECLARE_FEATURE(kHeliumProfileWindowSwitching);
+ BASE_DECLARE_FEATURE(kCustomizableBrowserShortcuts);
+ 
+ #if BUILDFLAG(IS_LINUX)
+--- a/chrome/browser/about_flags.cc
++++ b/chrome/browser/about_flags.cc
+@@ -5213,6 +5213,11 @@
+ #include "chrome/browser/ungoogled_platform_flag_choices.h"
+ #include "chrome/browser/existing_switch_flag_choices.h"
+ const FeatureEntry kFeatureEntries[] = {
++    {"helium-profile-window-switching", "Profile workspace switching",
++     "Switch independent profile windows at the same bounds while preserving "
++     "each profile's tabs and storage. Experimental; fullscreen uses normal "
++     "window switching. Closing the current window restores the previous one.",
++     kOsDesktop, FEATURE_VALUE_TYPE(features::kHeliumProfileWindowSwitching)},
+     {"helium-little-arc", "Little Arc",
+      "Open external HTTP and HTTPS links in a small window on macOS. "
+      "Press Command+Shift+Return to move the page into a normal window "
