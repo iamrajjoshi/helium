@@ -1,0 +1,1490 @@
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -342,6 +342,8 @@
+ 
+   source_set("tab_strip") {
+     sources = [
++      "github_live_folder_controller.h",
++      "github_live_folder_model.h",
+       "tab_close_types_data.h",
+       "tab_strip_model.h",
+       "tab_strip_model_delegate.h",
+@@ -369,6 +371,8 @@
+     public_deps = [ "//chrome/browser:browser_public_dependencies" ]
+ 
+     sources = [
++      "github_live_folder_controller.cc",
++      "github_live_folder_model.cc",
+       "tab_close_types_data.cc",
+       "tab_strip_model.cc",
+       "tab_strip_model_delegate.cc",
+@@ -419,6 +423,11 @@
+       "//components/tab_groups",
+       "//components/web_modal",
+       "//components/webapps/common",
++      "//content/public/browser",
++      "//net",
++      "//services/network/public/cpp",
++      "//ui/gfx/range",
++      "//url",
+     ]
+ 
+     # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
+@@ -934,6 +943,7 @@
+   source_set("unit_tests") {
+     testonly = true
+     sources = [
++      "github_live_folder_controller_unittest.cc",
+       "inactive_window_mouse_event_controller_unittest.cc",
+       "split_view_iph_controller_unittest.cc",
+       "tab_collection_storage_unittest.cc",
+@@ -1016,6 +1026,7 @@
+       "//content/public/browser",
+       "//content/test:test_support",
+       "//skia",
++      "//services/network:test_support",
+       "//testing/gmock",
+       "//testing/gtest",
+       "//ui/base",
+--- /dev/null
++++ b/chrome/browser/ui/tabs/github_live_folder_controller.cc
+@@ -0,0 +1,523 @@
++// Copyright 2026 Helium personal-fork contributors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/github_live_folder_controller.h"
++
++#include <algorithm>
++#include <set>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/location.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/tabs/github_live_folder_model.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "components/tabs/public/tab_group.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/web_contents.h"
++#include "net/base/load_flags.h"
++#include "net/base/net_errors.h"
++#include "net/http/http_response_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++#include "ui/gfx/range/range.h"
++#include "url/gurl.h"
++
++namespace helium {
++namespace {
++
++constexpr size_t kMaximumFoldersPerWindow = 3;
++constexpr size_t kMaximumResponseBytes = 1024 * 1024;
++constexpr base::TimeDelta kRefreshInterval = base::Minutes(5);
++constexpr base::TimeDelta kManualRefreshCooldown = base::Minutes(1);
++
++// Reject the entire response on malformed entries: a partial/error response
++// must never be interpreted as evidence that existing PRs disappeared.
++std::optional<std::vector<int>> ParsePullRequests(
++    const GitHubRepository& repository,
++    const std::string& body) {
++  auto parsed = base::JSONReader::Read(body, base::JSON_PARSE_RFC, 32);
++  if (!parsed || !parsed->is_list() ||
++      parsed->GetList().size() > kGitHubLiveFolderMaxPullRequests) {
++    return std::nullopt;
++  }
++  std::set<int> seen;
++  std::vector<int> numbers;
++  for (const auto& value : parsed->GetList()) {
++    if (!value.is_dict()) {
++      return std::nullopt;
++    }
++    const auto& entry = value.GetDict();
++    const auto number = entry.FindInt("number");
++    const auto* state = entry.FindString("state");
++    const auto* url = entry.FindString("html_url");
++    if (!number || !state || *state != "open" || !url ||
++        !IsExpectedGitHubPullUrl(repository, *number, *url) ||
++        !seen.insert(*number).second) {
++      return std::nullopt;
++    }
++    numbers.push_back(*number);
++  }
++  return numbers;
++}
++
++}  // namespace
++
++struct GitHubLiveFolderController::Folder {
++  Folder(tab_groups::TabGroupId group_id, GitHubRepository repo)
++      : group(group_id), repository(std::move(repo)) {}
++  ~Folder() = default;
++
++  const tab_groups::TabGroupId group;
++  const GitHubRepository repository;
++  bool live = true;
++  GitHubLiveFolderRefreshGuard refresh_guard;
++  std::unique_ptr<network::SimpleURLLoader> loader;
++  base::TimeTicks last_request;
++  base::TimeTicks retry_after;
++  std::u16string last_title;
++  std::map<int, base::WeakPtr<tabs::TabInterface>> tabs;
++  // Count every still-open tab this folder created, including tabs preserved
++  // outside the group or moved to another window. Never close them to free space.
++  struct CreatedTab {
++    base::WeakPtr<tabs::TabInterface> tab;
++    base::WeakPtr<content::WebContents> contents;
++  };
++  // Page identity survives moves that recreate TabInterface. Keep the tab
++  // identity too, so discarding/replacing WebContents does not free a slot.
++  std::vector<CreatedTab> created_tabs;
++  // Reserve before notifying insertion. If an observer moves a newly created
++  // tab out of this model before we can identify it, keep the slot occupied.
++  size_t reserved_tab_slots = 0;
++  // A tab the user closed, navigated, or moved is not reopened on every poll.
++  // This is pruned against each valid snapshot, keeping it bounded to the snapshot size.
++  std::set<int> dismissed;
++};
++
++GitHubLiveFolderController::GitHubLiveFolderController(TabStripModel* model)
++    : GitHubLiveFolderController(model, nullptr) {}
++
++GitHubLiveFolderController::GitHubLiveFolderController(
++    TabStripModel* model,
++    scoped_refptr<network::SharedURLLoaderFactory> factory)
++    : model_(model), factory_(std::move(factory)) {
++  CHECK(model_);
++  observation_.Observe(model_);
++}
++
++GitHubLiveFolderController::~GitHubLiveFolderController() = default;
++
++// static
++bool GitHubLiveFolderController::CanCreateForTab(const TabStripModel* model,
++                                                int index) {
++  return model->ContainsIndex(index) && !model->closing_all() &&
++         model->SupportsTabGroups() && !model->profile()->IsOffTheRecord() &&
++         !model->profile()->IsGuestSession() &&
++         !model->delegate()->IsForWebApp() && !model->IsTabPinned(index) &&
++         !model->GetSplitForTab(index) && !model->GetTabGroupForTab(index) &&
++         ParseGitHubRepositoryUrl(
++             model->GetWebContentsAt(index)->GetLastCommittedURL().spec())
++             .has_value();
++}
++
++bool GitHubLiveFolderController::CanCreate(int index) const {
++  if (!CanCreateForTab(model_, index)) {
++    return false;
++  }
++  const auto repository = ParseGitHubRepositoryUrl(
++      model_->GetWebContentsAt(index)->GetLastCommittedURL().spec());
++  size_t live_count = 0;
++  for (const auto& [group, folder] : folders_) {
++    if (folder->live && GroupExists(group)) {
++      ++live_count;
++      if (folder->repository == *repository) {
++        return false;
++      }
++    }
++  }
++  return live_count < kMaximumFoldersPerWindow;
++}
++
++GitHubLiveFolderController::Folder*
++GitHubLiveFolderController::GetFolderAt(int index) const {
++  if (!model_->ContainsIndex(index)) {
++    return nullptr;
++  }
++  const auto group = model_->GetTabGroupForTab(index);
++  if (!group) {
++    return nullptr;
++  }
++  auto it = folders_.find(*group);
++  return it != folders_.end() && it->second->live ? it->second.get() : nullptr;
++}
++
++bool GitHubLiveFolderController::HasFolderAt(int index) const {
++  return GetFolderAt(index) != nullptr;
++}
++
++bool GitHubLiveFolderController::CanRefreshAt(int index) const {
++  const Folder* folder = GetFolderAt(index);
++  const auto now = base::TimeTicks::Now();
++  return folder && !folder->loader && !model_->closing_all() &&
++         now >= folder->retry_after &&
++         now - folder->last_request >= kManualRefreshCooldown;
++}
++
++bool GitHubLiveFolderController::GroupExists(
++    const tab_groups::TabGroupId& group) const {
++  return model_->group_model() &&
++         model_->group_model()->ContainsTabGroup(group);
++}
++
++void GitHubLiveFolderController::Create(int index) {
++  if (!CanCreate(index)) {
++    return;
++  }
++  std::erase_if(folders_, [](const auto& item) { return !item.second->live; });
++  auto repository = ParseGitHubRepositoryUrl(
++      model_->GetWebContentsAt(index)->GetLastCommittedURL().spec());
++  const auto weak_this = weak_factory_.GetWeakPtr();
++  const auto group = model_->AddToNewGroup({index});
++  if (!weak_this || !GroupExists(group) || model_->closing_all()) {
++    return;
++  }
++  auto folder = std::make_shared<Folder>(group, std::move(*repository));
++  folder->last_title = model_->group_model()
++                           ->GetTabGroup(group)
++                           ->visual_data()
++                           ->title();
++  folders_.emplace(group, folder);
++  Refresh(group);
++  if (!weak_this || !folder->live || !GroupExists(group)) {
++    return;
++  }
++  if (!timer_.IsRunning()) {
++    timer_.Start(FROM_HERE, kRefreshInterval, this,
++                 &GitHubLiveFolderController::RefreshAll);
++  }
++}
++
++void GitHubLiveFolderController::RefreshAt(int index) {
++  if (CanRefreshAt(index)) {
++    const auto group = GetFolderAt(index)->group;
++    Refresh(group);
++  }
++}
++
++void GitHubLiveFolderController::StopAt(int index) {
++  if (Folder* folder = GetFolderAt(index)) {
++    // Keep state alive even if a synchronous observer starts a new folder and
++    // prunes this stopped entry while the title notification is dispatched.
++    const auto retained_folder = folders_.at(folder->group);
++    Cancel(*retained_folder);
++    StopTimerIfIdle();
++    SetStatus(*retained_folder, "stopped");
++  }
++}
++
++void GitHubLiveFolderController::Cancel(Folder& folder) {
++  folder.live = false;
++  folder.refresh_guard.Stop();
++  folder.loader.reset();
++}
++
++void GitHubLiveFolderController::StopTimerIfIdle() {
++  if (std::ranges::none_of(folders_, [](const auto& item) {
++        return item.second->live;
++      })) {
++    timer_.Stop();
++  }
++}
++
++void GitHubLiveFolderController::OnTabGroupChanged(
++    const TabGroupChange& change) {
++  if (change.type != TabGroupChange::kClosed) {
++    return;
++  }
++  auto it = folders_.find(change.group);
++  if (it != folders_.end()) {
++    // Do not erase synchronously: removing the final owned tab during a
++    // snapshot can close a group and re-enter this observer.
++    Cancel(*it->second);
++    StopTimerIfIdle();
++  }
++}
++
++void GitHubLiveFolderController::RefreshAll() {
++  const auto weak_this = weak_factory_.GetWeakPtr();
++  std::vector<tab_groups::TabGroupId> groups;
++  for (const auto& [group, folder] : folders_) {
++    groups.push_back(group);
++  }
++  for (const auto& group : groups) {
++    const auto it = folders_.find(group);
++    if (it == folders_.end()) {
++      continue;
++    }
++    const auto folder = it->second;
++    if (!folder->live) {
++      continue;
++    }
++    if (!GroupExists(group)) {
++      Cancel(*folder);
++    } else if (!folder->loader &&
++               base::TimeTicks::Now() >= folder->retry_after &&
++               base::TimeTicks::Now() - folder->last_request >=
++                   kRefreshInterval) {
++      Refresh(group);
++      if (!weak_this) {
++        return;
++      }
++    }
++  }
++  StopTimerIfIdle();
++}
++
++void GitHubLiveFolderController::Refresh(
++    const tab_groups::TabGroupId& group) {
++  auto it = folders_.find(group);
++  if (it == folders_.end() || !it->second->live ||
++      !GroupExists(group) || model_->closing_all()) {
++    return;
++  }
++  const auto retained_folder = it->second;
++  Folder& folder = *retained_folder;
++  const auto weak_this = weak_factory_.GetWeakPtr();
++  folder.loader.reset();
++  const uint64_t generation = folder.refresh_guard.Begin();
++  folder.last_request = base::TimeTicks::Now();
++  SetStatus(folder, "refreshing");
++  if (!weak_this || !folder.live ||
++      !folder.refresh_guard.IsCurrent(generation) || !GroupExists(group) ||
++      model_->closing_all()) {
++    return;
++  }
++
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = GURL(folder.repository.ApiUrl());
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->redirect_mode = network::mojom::RedirectMode::kError;
++  request->load_flags = net::LOAD_BYPASS_CACHE | net::LOAD_DISABLE_CACHE;
++  request->headers.SetHeader("Accept", "application/vnd.github+json");
++  request->headers.SetHeader("X-GitHub-Api-Version", "2022-11-28");
++
++  constexpr auto annotation = net::DefineNetworkTrafficAnnotation(
++      "helium_github_live_folder", R"(
++        semantics {
++          sender: "Helium GitHub Live Folder"
++          description: "Reads the latest 10 open pull requests for a public "
++                       "GitHub repository chosen by the user and updates "
++                       "a native tab group. No authentication is used."
++          trigger: "Explicit Create GitHub live folder or Refresh action, "
++                   "then once per five minutes while the live group exists."
++          data: "The repository owner/name selected by the user."
++          destination: WEBSITE
++        }
++        policy {
++          cookies_allowed: NO
++          setting: "Disabled by default. Stop GitHub live folder, remove "
++                   "the group, or close the window to stop requests. "
++                   "Live state is not restored after restarting."
++          policy_exception_justification: "This opt-in personal-fork feature "
++                                          "has no enterprise policy."
++        })");
++  folder.loader =
++      network::SimpleURLLoader::Create(std::move(request), annotation);
++  folder.loader->SetTimeoutDuration(base::Seconds(30));
++  if (!factory_) {
++    factory_ = model_->profile()
++                   ->GetDefaultStoragePartition()
++                   ->GetURLLoaderFactoryForBrowserProcess();
++  }
++  folder.loader->DownloadToString(
++      factory_.get(),
++      base::BindOnce(&GitHubLiveFolderController::OnResponse,
++                     weak_factory_.GetWeakPtr(), group, generation),
++      kMaximumResponseBytes);
++}
++
++void GitHubLiveFolderController::SetStatus(Folder& folder,
++                                          const std::string& status) {
++  if (!GroupExists(folder.group)) {
++    return;
++  }
++  auto* group = model_->group_model()->GetTabGroup(folder.group);
++  const auto* data = group->visual_data();
++  // Preserve an explicitly customized name, color, and collapsed state.
++  if (data->title() != folder.last_title) {
++    return;
++  }
++  folder.last_title = base::UTF8ToUTF16(
++      "GitHub: " + folder.repository.Key() + " [" + status + "]");
++  auto new_data = tab_groups::TabGroupVisualData(
++      folder.last_title, data->color(), data->is_collapsed());
++  model_->ChangeTabGroupVisuals(folder.group, std::move(new_data), false);
++}
++
++void GitHubLiveFolderController::OnResponse(
++    const tab_groups::TabGroupId& group,
++    uint64_t generation,
++    std::optional<std::string> body) {
++  auto it = folders_.find(group);
++  if (it == folders_.end() || !it->second->live ||
++      !it->second->refresh_guard.IsCurrent(generation) ||
++      !GroupExists(group) || model_->closing_all()) {
++    return;
++  }
++  const auto retained_folder = it->second;
++  Folder& folder = *retained_folder;
++  const auto weak_this = weak_factory_.GetWeakPtr();
++  CHECK(folder.loader);
++  const auto* info = folder.loader->ResponseInfo();
++  const int status = info && info->headers ? info->headers->response_code() : 0;
++  const bool success = folder.loader->NetError() == net::OK && status == 200;
++  folder.loader.reset();
++
++  if (!success || !body) {
++    if (status == 403 || status == 429) {
++      folder.retry_after = base::TimeTicks::Now() + base::Hours(1);
++      SetStatus(folder, "rate limited; retry in 1 hour");
++    } else if (status == 401 || status == 404 ||
++               (status >= 300 && status < 400)) {
++      folder.retry_after = base::TimeTicks::Now() + base::Minutes(30);
++      SetStatus(folder, "unavailable; public repositories only");
++    } else {
++      SetStatus(folder, "refresh failed; keeping tabs");
++    }
++    return;
++  }
++  const auto numbers = ParsePullRequests(folder.repository, *body);
++  if (!numbers) {
++    SetStatus(folder, "invalid response; keeping tabs");
++    return;
++  }
++
++  const std::set<int> wanted(numbers->begin(), numbers->end());
++  std::vector<int> ungroup;
++  for (auto owned = folder.tabs.begin(); owned != folder.tabs.end();) {
++    auto* tab = owned->second.get();
++    const int index = tab ? model_->GetIndexOfTab(tab) : TabStripModel::kNoTab;
++    if (!tab || !model_->ContainsIndex(index) ||
++        model_->GetTabGroupForTab(index) != group ||
++        model_->GetSplitForTab(index).has_value() ||
++        !IsExpectedGitHubPullUrl(folder.repository, owned->first,
++                                tab->GetContents()->GetVisibleURL().spec())) {
++      folder.dismissed.insert(owned->first);
++      owned = folder.tabs.erase(owned);
++    } else if (!wanted.contains(owned->first)) {
++      ungroup.push_back(index);
++      owned = folder.tabs.erase(owned);
++    } else {
++      ++owned;
++    }
++  }
++  std::erase_if(folder.dismissed,
++                [&](int number) { return !wanted.contains(number); });
++  if (!ungroup.empty()) {
++    std::ranges::sort(ungroup);
++    // Never close a tab: the user may have a draft comment or other state in it.
++    model_->RemoveFromGroup(ungroup);
++    if (!weak_this) {
++      return;
++    }
++  }
++  if (!folder.live || !folder.refresh_guard.IsCurrent(generation) ||
++      !GroupExists(group) || model_->closing_all()) {
++    return;
++  }
++
++  for (auto& created : folder.created_tabs) {
++    if (created.tab) {
++      created.contents = created.tab->GetContents()->GetWeakPtr();
++    }
++  }
++  std::erase_if(folder.created_tabs, [](const auto& created) {
++    return !created.tab && !created.contents;
++  });
++  bool tab_limit_reached = false;
++  for (int number : *numbers) {
++    if (folder.tabs.contains(number) || folder.dismissed.contains(number)) {
++      continue;
++    }
++    bool already_open = false;
++    // Check the whole window: a PR may have left the top-ten snapshot and
++    // been preserved outside the group, or already be open in a user's tab.
++    for (int index = 0; index < model_->count(); ++index) {
++      if (IsExpectedGitHubPullUrl(
++              folder.repository, number,
++              model_->GetWebContentsAt(index)->GetVisibleURL().spec())) {
++        already_open = true;
++        break;
++      }
++    }
++    if (already_open) {
++      // Do not take ownership of a pre-existing tab the user added themselves.
++      folder.dismissed.insert(number);
++      continue;
++    }
++    if (folder.created_tabs.size() + folder.reserved_tab_slots >=
++        kGitHubLiveFolderMaxPullRequests) {
++      tab_limit_reached = true;
++      continue;
++    }
++    const auto range = model_->group_model()->GetTabGroup(group)->ListTabs();
++    const int insertion_index = range.end();
++    std::vector<base::WeakPtr<content::WebContents>> previous_contents;
++    for (int index = 0; index < model_->count(); ++index) {
++      previous_contents.push_back(model_->GetWebContentsAt(index)->GetWeakPtr());
++    }
++    ++folder.reserved_tab_slots;
++    model_->delegate()->AddTabAt(
++        GURL(folder.repository.PullUrl(number)), insertion_index, false, group,
++        model_->IsTabPinned(range.start()));
++    if (!weak_this) {
++      return;
++    }
++    if (!folder.live || !folder.refresh_guard.IsCurrent(generation) ||
++        !GroupExists(group) || model_->closing_all()) {
++      return;
++    }
++    for (int index = 0; index < model_->count(); ++index) {
++      auto* tab = model_->GetTabAtIndex(index);
++      if (std::ranges::any_of(previous_contents, [tab](const auto& previous) {
++            return previous.get() == tab->GetContents();
++          }) ||
++          !IsExpectedGitHubPullUrl(folder.repository, number,
++                                  tab->GetContents()->GetVisibleURL().spec())) {
++        continue;
++      }
++      --folder.reserved_tab_slots;
++      folder.created_tabs.push_back(
++          {tab->GetWeakPtr(), tab->GetContents()->GetWeakPtr()});
++      if (model_->GetTabGroupForTab(index) == group) {
++        folder.tabs[number] = tab->GetWeakPtr();
++      } else {
++        folder.dismissed.insert(number);
++      }
++      break;
++    }
++  }
++  folder.retry_after = base::TimeTicks();
++  SetStatus(folder, base::NumberToString(numbers->size()) +
++                        (numbers->size() == kGitHubLiveFolderMaxPullRequests
++                             ? " latest open PRs"
++                             : " open PRs") +
++                        (tab_limit_reached ? "; tab limit reached" : ""));
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/ui/tabs/github_live_folder_controller.h
+@@ -0,0 +1,75 @@
++// Copyright 2026 Helium personal-fork contributors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_TABS_GITHUB_LIVE_FOLDER_CONTROLLER_H_
++#define CHROME_BROWSER_UI_TABS_GITHUB_LIVE_FOLDER_CONTROLLER_H_
++
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tab_groups/tab_group_id.h"
++
++class TabStripModel;
++namespace network {
++class SharedURLLoaderFactory;
++}
++
++namespace helium {
++
++// An opt-in, window-scoped native tab-group controller. It is never constructed
++// by startup/session restore, never authenticates to GitHub, and never closes
++// tabs. Moving its group to another window stops refresh in the source window.
++class GitHubLiveFolderController : public TabStripModelObserver {
++ public:
++  explicit GitHubLiveFolderController(TabStripModel* model);
++  GitHubLiveFolderController(
++      TabStripModel* model,
++      scoped_refptr<network::SharedURLLoaderFactory> factory);
++  ~GitHubLiveFolderController() override;
++
++  static bool CanCreateForTab(const TabStripModel* model, int index);
++  bool CanCreate(int index) const;
++  bool HasFolderAt(int index) const;
++  bool CanRefreshAt(int index) const;
++  void Create(int index);
++  void RefreshAt(int index);
++  void StopAt(int index);
++
++  // TabStripModelObserver:
++  void OnTabGroupChanged(const TabGroupChange& change) override;
++
++ private:
++  struct Folder;
++  Folder* GetFolderAt(int index) const;
++  bool GroupExists(const tab_groups::TabGroupId& group) const;
++  void RefreshAll();
++  void Refresh(const tab_groups::TabGroupId& group);
++  void OnResponse(const tab_groups::TabGroupId& group,
++                  uint64_t generation,
++                  std::optional<std::string> body);
++  void SetStatus(Folder& folder, const std::string& status);
++  void Cancel(Folder& folder);
++  void StopTimerIfIdle();
++
++  const raw_ptr<TabStripModel> model_;
++  scoped_refptr<network::SharedURLLoaderFactory> factory_;
++  std::map<tab_groups::TabGroupId, std::shared_ptr<Folder>> folders_;
++  base::RepeatingTimer timer_;
++  base::ScopedObservation<TabStripModel, TabStripModelObserver> observation_{
++      this};
++  base::WeakPtrFactory<GitHubLiveFolderController> weak_factory_{this};
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_TABS_GITHUB_LIVE_FOLDER_CONTROLLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/tabs/github_live_folder_controller_unittest.cc
+@@ -0,0 +1,475 @@
++// Copyright 2026 Helium personal-fork contributors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/github_live_folder_controller.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/test/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "chrome/browser/ui/tabs/github_live_folder_model.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_model.h"
++#include "chrome/browser/ui/tabs/split_tab_metrics.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/test_tab_strip_model_delegate.h"
++#include "chrome/test/base/testing_profile.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tabs/public/tab_group.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/test/browser_task_environment.h"
++#include "content/public/test/test_renderer_host.h"
++#include "content/public/test/web_contents_tester.h"
++#include "net/http/http_status_code.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/weak_wrapper_shared_url_loader_factory.h"
++#include "services/network/test/test_url_loader_factory.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/gfx/range/range.h"
++#include "url/gurl.h"
++
++namespace helium {
++namespace {
++
++// Uses the real TabStripModel and controller with fake WebContents and network.
++// These component tests are not a substitute for a compiled browser UI run.
++class LiveFolderTabDelegate : public TestTabStripModelDelegate {
++ public:
++  raw_ptr<TabStripModel> model = nullptr;
++
++  void AddTabAt(const GURL& url,
++                int index,
++                bool foreground,
++                std::optional<tab_groups::TabGroupId> group,
++                bool pinned) override {
++    auto contents = content::WebContentsTester::CreateTestWebContents(
++        model->profile(), nullptr);
++    content::WebContentsTester::For(contents.get())->NavigateAndCommit(url);
++    model->InsertWebContentsAt(
++        index, std::move(contents),
++        foreground ? AddTabTypes::ADD_ACTIVE : AddTabTypes::ADD_NONE, group);
++  }
++};
++
++class LiveFolderVisualObserver : public TabStripModelObserver {
++ public:
++  int visual_changes = 0;
++  base::RepeatingClosure on_visual_change;
++
++  void OnTabGroupChanged(const TabGroupChange& change) override {
++    if (change.type == TabGroupChange::kVisualsChanged) {
++      ++visual_changes;
++      if (on_visual_change) {
++        on_visual_change.Run();
++      }
++    }
++  }
++};
++
++class GitHubLiveFolderControllerTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    model_ = std::make_unique<TabStripModel>(&delegate_, &profile_);
++    delegate_.model = model_.get();
++    AddRoot("https://github.com/example/project");
++    source_tab_ = model_->GetWebContentsAt(0);
++    controller_ = std::make_unique<GitHubLiveFolderController>(
++        model_.get(), factory_.GetSafeWeakWrapper());
++  }
++
++  void TearDown() override {
++    controller_.reset();
++    delegate_.model = nullptr;
++    source_tab_ = nullptr;
++    model_.reset();
++  }
++
++  int AddRoot(const std::string& url) {
++    auto contents = content::WebContentsTester::CreateTestWebContents(
++        &profile_, nullptr);
++    content::WebContentsTester::For(contents.get())
++        ->NavigateAndCommit(GURL(url));
++    model_->AppendWebContents(std::move(contents), false);
++    return model_->count() - 1;
++  }
++
++  int RootIndex() const {
++    return model_->GetIndexOfWebContents(source_tab_);
++  }
++
++  std::string Response(int first, int last) {
++    std::string body = "[";
++    for (int number = first; number <= last; ++number) {
++      if (number != first) {
++        body += ",";
++      }
++      body += "{\"number\":" + base::NumberToString(number) +
++              ",\"state\":\"open\",\"html_url\":\"" +
++              repository_.PullUrl(number) + "\"}";
++    }
++    return body + "]";
++  }
++
++  void Respond(const std::string& body,
++               net::HttpStatusCode status = net::HTTP_OK) {
++    task_environment_.RunUntilIdle();
++    ASSERT_TRUE(factory_.SimulateResponseForPendingRequest(
++        repository_.ApiUrl(), body, status));
++    task_environment_.RunUntilIdle();
++  }
++
++  void Refresh() {
++    task_environment_.FastForwardBy(base::Minutes(1));
++    controller_->RefreshAt(RootIndex());
++    task_environment_.RunUntilIdle();
++  }
++
++  size_t GroupSize() {
++    const auto group = model_->GetTabGroupForTab(RootIndex());
++    EXPECT_TRUE(group);
++    return group ? model_->group_model()->GetTabGroup(*group)->ListTabs().length()
++                 : 0;
++  }
++
++  content::BrowserTaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  content::RenderViewHostTestEnabler rvh_test_enabler_;
++  TestingProfile profile_;
++  const tabs::TabModel::PreventFeatureInitializationForTesting prevent_;
++  LiveFolderTabDelegate delegate_;
++  network::TestURLLoaderFactory factory_;
++  const GitHubRepository repository_{"example", "project"};
++  raw_ptr<content::WebContents> source_tab_ = nullptr;
++  std::unique_ptr<TabStripModel> model_;
++  std::unique_ptr<GitHubLiveFolderController> controller_;
++};
++
++TEST_F(GitHubLiveFolderControllerTest, NoRequestsUntilExplicitCreate) {
++  task_environment_.FastForwardBy(base::Hours(1));
++  EXPECT_EQ(0, factory_.NumPending());
++  EXPECT_EQ(1, model_->count());
++  EXPECT_TRUE(model_->IsContextMenuCommandEnabled(
++      0, TabStripModel::CommandCreateGitHubLiveFolder));
++  controller_->Create(RootIndex());
++  ASSERT_EQ(1, factory_.NumPending());
++  const auto& request = factory_.GetPendingRequest(0)->request;
++  EXPECT_EQ(GURL(repository_.ApiUrl()), request.url);
++  EXPECT_EQ(network::mojom::CredentialsMode::kOmit, request.credentials_mode);
++  EXPECT_EQ(network::mojom::RedirectMode::kError, request.redirect_mode);
++  EXPECT_TRUE(request.referrer.empty());
++  EXPECT_FALSE(request.headers.HasHeader("Authorization"));
++  EXPECT_FALSE(request.headers.HasHeader("Cookie"));
++  Respond(Response(1, 2));
++  EXPECT_EQ(3, model_->count());
++  EXPECT_EQ(3u, GroupSize());
++  EXPECT_FALSE(controller_->CanRefreshAt(RootIndex()));
++}
++
++TEST_F(GitHubLiveFolderControllerTest, StatusNotifiesModelAndPreservesCustomName) {
++  LiveFolderVisualObserver observer;
++  base::ScopedObservation<TabStripModel, TabStripModelObserver> observation{
++      &observer};
++  observation.Observe(model_.get());
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  EXPECT_GE(observer.visual_changes, 2);
++  const auto group = *model_->GetTabGroupForTab(RootIndex());
++  auto custom = *model_->group_model()->GetTabGroup(group)->visual_data();
++  custom.SetTitle(u"My review queue");
++  model_->ChangeTabGroupVisuals(group, custom, true);
++  Refresh();
++  Respond(Response(1, 2));
++  EXPECT_EQ(custom, *model_->group_model()->GetTabGroup(group)->visual_data());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, DestructionDuringStatusStartsNoNetwork) {
++  LiveFolderVisualObserver observer;
++  base::ScopedObservation<TabStripModel, TabStripModelObserver> observation{
++      &observer};
++  observation.Observe(model_.get());
++  observer.on_visual_change = base::BindLambdaForTesting([&] {
++    if (controller_ && controller_->HasFolderAt(RootIndex())) {
++      controller_.reset();
++    }
++  });
++  controller_->Create(RootIndex());
++  EXPECT_FALSE(controller_);
++  task_environment_.FastForwardBy(base::Hours(1));
++  EXPECT_EQ(0, factory_.NumPending());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, DestructionDuringGroupCreationIsSafe) {
++  LiveFolderVisualObserver observer;
++  base::ScopedObservation<TabStripModel, TabStripModelObserver> observation{
++      &observer};
++  observation.Observe(model_.get());
++  observer.on_visual_change = base::BindLambdaForTesting([&] {
++    controller_.reset();
++  });
++  controller_->Create(RootIndex());
++  EXPECT_FALSE(controller_);
++  task_environment_.FastForwardBy(base::Hours(1));
++  EXPECT_EQ(0, factory_.NumPending());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, StopDuringStatusStartsNoNetwork) {
++  LiveFolderVisualObserver observer;
++  base::ScopedObservation<TabStripModel, TabStripModelObserver> observation{
++      &observer};
++  observation.Observe(model_.get());
++  bool stopped = false;
++  observer.on_visual_change = base::BindLambdaForTesting([&] {
++    if (!stopped && controller_->HasFolderAt(RootIndex())) {
++      stopped = true;
++      controller_->StopAt(RootIndex());
++    }
++  });
++  controller_->Create(RootIndex());
++  EXPECT_TRUE(stopped);
++  EXPECT_FALSE(controller_->HasFolderAt(RootIndex()));
++  task_environment_.FastForwardBy(base::Hours(1));
++  EXPECT_EQ(0, factory_.NumPending());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, MissingPullRequestsAreNeverClosed) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  auto* first_pr = model_->GetWebContentsAt(1);
++  auto* second_pr = model_->GetWebContentsAt(2);
++  model_->ActivateTabAt(1);
++  Refresh();
++  Respond("[]");
++  EXPECT_EQ(3, model_->count());
++  EXPECT_EQ(1u, GroupSize());
++  EXPECT_EQ(first_pr, model_->GetActiveWebContents());
++  EXPECT_NE(TabStripModel::kNoTab, model_->GetIndexOfWebContents(second_pr));
++}
++
++TEST_F(GitHubLiveFolderControllerTest, UserChangesAreNotUndoneByPolling) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  auto* navigated = model_->GetWebContentsAt(1);
++  content::WebContentsTester::For(navigated)
++      ->NavigateAndCommit(GURL("https://example.com/draft"));
++  model_->RemoveFromGroup({2});
++  Refresh();
++  Respond(Response(1, 2));
++  EXPECT_EQ(3, model_->count());
++  EXPECT_EQ(2u, GroupSize());
++  EXPECT_EQ(GURL("https://example.com/draft"), navigated->GetVisibleURL());
++  Refresh();
++  Respond(Response(1, 2));
++  EXPECT_EQ(3, model_->count());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, SnapshotChurnDoesNotDuplicateTabs) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  Refresh();
++  Respond(Response(2, 3));
++  ASSERT_EQ(4, model_->count());
++  Refresh();
++  Respond(Response(1, 2));
++  EXPECT_EQ(4, model_->count());
++  EXPECT_EQ(2u, GroupSize());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, ExistingTabsElsewhereAreLeftAlone) {
++  const int existing = AddRoot(repository_.PullUrl(1));
++  auto* existing_contents = model_->GetWebContentsAt(existing);
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  EXPECT_EQ(3, model_->count());
++  EXPECT_EQ(2u, GroupSize());
++  EXPECT_FALSE(model_->GetTabGroupForTab(
++      model_->GetIndexOfWebContents(existing_contents)));
++}
++
++TEST_F(GitHubLiveFolderControllerTest, ManuallyClosedTabsAreNotReopened) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  model_->CloseWebContentsAt(1, TabCloseTypes::CLOSE_NONE);
++  ASSERT_EQ(2, model_->count());
++  Refresh();
++  Respond(Response(1, 2));
++  EXPECT_EQ(2, model_->count());
++  EXPECT_EQ(2u, GroupSize());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, UserCreatedSplitIsPreserved) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  model_->ActivateTabAt(1);
++  const auto split = model_->AddToNewSplit(
++      {2}, split_tabs::SplitTabVisualData(),
++      split_tabs::SplitTabCreatedSource::kTabContextMenu);
++  ASSERT_EQ(split, model_->GetSplitForTab(1));
++  ASSERT_EQ(split, model_->GetSplitForTab(2));
++  Refresh();
++  Respond(Response(2, 2));
++  EXPECT_EQ(3, model_->count());
++  EXPECT_EQ(3u, GroupSize());
++  EXPECT_EQ(split, model_->GetSplitForTab(1));
++  EXPECT_EQ(split, model_->GetSplitForTab(2));
++}
++
++TEST_F(GitHubLiveFolderControllerTest, ErrorsAndMalformedSnapshotsKeepTabs) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 2));
++  Refresh();
++  Respond("server unavailable", net::HTTP_INTERNAL_SERVER_ERROR);
++  EXPECT_EQ(3u, GroupSize());
++  const std::string invalid[] = {
++      "not json", "{}", "[{}]", Response(1, 11),
++      "[{\"number\":1,\"state\":\"open\","
++      "\"html_url\":\"https://evil.example/example/project/pull/1\"}]",
++      "[{\"number\":1,\"state\":\"closed\","
++      "\"html_url\":\"https://github.com/example/project/pull/1\"}]",
++      "[{\"number\":1,\"state\":\"open\","
++      "\"html_url\":\"https://github.com/example/project/pull/1\"},"
++      "{\"number\":1,\"state\":\"open\","
++      "\"html_url\":\"https://github.com/example/project/pull/1\"}]"};
++  for (const auto& body : invalid) {
++    Refresh();
++    Respond(body);
++    EXPECT_EQ(3u, GroupSize());
++    EXPECT_EQ(3, model_->count());
++  }
++}
++
++TEST_F(GitHubLiveFolderControllerTest, HardCapIsVisibleAndNeverPaginates) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 10));
++  EXPECT_EQ(11, model_->count());
++  EXPECT_EQ(11u, GroupSize());
++  const auto group = *model_->GetTabGroupForTab(RootIndex());
++  EXPECT_NE(std::u16string::npos,
++            model_->group_model()->GetTabGroup(group)->visual_data()->title()
++                .find(u"10 latest open PRs"));
++  EXPECT_EQ(0, factory_.NumPending());
++  task_environment_.FastForwardBy(base::Minutes(4));
++  EXPECT_EQ(0, factory_.NumPending());
++  task_environment_.FastForwardBy(base::Minutes(1));
++  EXPECT_EQ(1, factory_.NumPending());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, PreservedTabsCountAgainstHardOpenTabCap) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 10));
++  auto* preserved = model_->GetWebContentsAt(1);
++  Refresh();
++  Respond(Response(11, 20));
++  ASSERT_EQ(11, model_->count());
++  EXPECT_EQ(1u, GroupSize());
++  const auto group = *model_->GetTabGroupForTab(RootIndex());
++  EXPECT_NE(std::u16string::npos,
++            model_->group_model()->GetTabGroup(group)->visual_data()->title()
++                .find(u"tab limit reached"));
++  model_->CloseWebContentsAt(model_->GetIndexOfWebContents(preserved),
++                             TabCloseTypes::CLOSE_NONE);
++  Refresh();
++  Respond(Response(11, 20));
++  // Closing one preserved tab frees exactly one automatic-creation slot.
++  EXPECT_EQ(11, model_->count());
++  EXPECT_EQ(2u, GroupSize());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, RecreatedTabModelDoesNotFreePageSlot) {
++  controller_->Create(RootIndex());
++  Respond(Response(1, 10));
++  auto moved_contents = model_->DetachWebContentsAtForInsertion(1);
++  LiveFolderTabDelegate other_delegate;
++  TabStripModel other_window(&other_delegate, &profile_);
++  other_delegate.model = &other_window;
++  other_window.AppendWebContents(std::move(moved_contents), false);
++  Refresh();
++  Respond(Response(11, 20));
++  // The old TabInterface is gone but its page survives in the other window.
++  EXPECT_EQ(10, model_->count());
++  EXPECT_EQ(1u, GroupSize());
++  other_window.CloseAllTabs();
++  Refresh();
++  Respond(Response(11, 20));
++  EXPECT_EQ(11, model_->count());
++  EXPECT_EQ(2u, GroupSize());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, StopCancelsPendingAndScheduledWork) {
++  controller_->Create(RootIndex());
++  ASSERT_EQ(1, factory_.NumPending());
++  controller_->StopAt(RootIndex());
++  EXPECT_FALSE(controller_->HasFolderAt(RootIndex()));
++  task_environment_.FastForwardBy(base::Hours(2));
++  EXPECT_EQ(0, factory_.NumPending());
++  EXPECT_EQ(1, model_->count());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, RemovingGroupCancelsPendingWork) {
++  controller_->Create(RootIndex());
++  ASSERT_EQ(1, factory_.NumPending());
++  model_->RemoveFromGroup({0});
++  task_environment_.FastForwardBy(base::Hours(2));
++  EXPECT_EQ(0, factory_.NumPending());
++  EXPECT_EQ(1, model_->count());
++  EXPECT_FALSE(controller_->HasFolderAt(RootIndex()));
++}
++
++TEST_F(GitHubLiveFolderControllerTest, RateLimitBacksOffForAnHour) {
++  controller_->Create(RootIndex());
++  Respond("{}", net::HTTP_FORBIDDEN);
++  EXPECT_FALSE(controller_->CanRefreshAt(RootIndex()));
++  task_environment_.FastForwardBy(base::Minutes(59));
++  controller_->RefreshAt(RootIndex());
++  EXPECT_EQ(0, factory_.NumPending());
++  task_environment_.FastForwardBy(base::Minutes(1));
++  EXPECT_EQ(1, factory_.NumPending());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, DuplicateRepositoryAndFolderCap) {
++  controller_->Create(RootIndex());
++  Respond("[]");
++  const int duplicate = AddRoot("https://github.com/EXAMPLE/PROJECT/pulls");
++  EXPECT_FALSE(controller_->CanCreate(duplicate));
++  int second = AddRoot("https://github.com/example/second");
++  controller_->Create(second);
++  int third = AddRoot("https://github.com/example/third");
++  controller_->Create(third);
++  int fourth = AddRoot("https://github.com/example/fourth");
++  EXPECT_FALSE(controller_->CanCreate(fourth));
++  controller_->StopAt(RootIndex());
++  EXPECT_TRUE(controller_->CanCreate(fourth));
++}
++
++TEST_F(GitHubLiveFolderControllerTest, IncognitoCannotOptIn) {
++  auto* off_the_record = profile_.GetPrimaryOTRProfile(true);
++  TabStripModel incognito_model(&delegate_, off_the_record);
++  auto contents = content::WebContentsTester::CreateTestWebContents(
++      off_the_record, nullptr);
++  content::WebContentsTester::For(contents.get())
++      ->NavigateAndCommit(GURL("https://github.com/example/project"));
++  incognito_model.AppendWebContents(std::move(contents), false);
++  EXPECT_FALSE(GitHubLiveFolderController::CanCreateForTab(&incognito_model, 0));
++  EXPECT_FALSE(incognito_model.IsContextMenuCommandEnabled(
++      0, TabStripModel::CommandCreateGitHubLiveFolder));
++  EXPECT_EQ(0, factory_.NumPending());
++}
++
++TEST_F(GitHubLiveFolderControllerTest, UnsupportedUrlsAndPinnedTabs) {
++  int invalid = AddRoot("https://github.com.evil.example/example/project");
++  EXPECT_FALSE(controller_->CanCreate(invalid));
++  model_->SetTabPinned(0, true);
++  EXPECT_FALSE(controller_->CanCreate(0));
++  EXPECT_EQ(0, factory_.NumPending());
++}
++
++}  // namespace
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/ui/tabs/github_live_folder_model.cc
+@@ -0,0 +1,167 @@
++// Copyright (C) 2026 The personal Helium fork contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "chrome/browser/ui/tabs/github_live_folder_model.h"
++
++#include <limits>
++
++namespace helium {
++namespace {
++
++constexpr std::string_view kWebOrigin = "https://github.com/";
++
++bool IsAsciiAlphanumeric(char value) {
++  return (value >= 'a' && value <= 'z') ||
++         (value >= 'A' && value <= 'Z') ||
++         (value >= '0' && value <= '9');
++}
++
++char ToLowerAscii(char value) {
++  return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;
++}
++
++bool EqualIgnoringAsciiCase(std::string_view a, std::string_view b) {
++  if (a.size() != b.size()) {
++    return false;
++  }
++  for (std::size_t i = 0; i < a.size(); ++i) {
++    if (ToLowerAscii(a[i]) != ToLowerAscii(b[i])) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool IsValidOwner(std::string_view owner) {
++  if (owner.empty() || owner.size() > 39 ||
++      !IsAsciiAlphanumeric(owner.front()) ||
++      !IsAsciiAlphanumeric(owner.back())) {
++    return false;
++  }
++  bool previous_was_hyphen = false;
++  for (const char value : owner) {
++    if (!IsAsciiAlphanumeric(value) && value != '-') {
++      return false;
++    }
++    if (value == '-' && previous_was_hyphen) {
++      return false;
++    }
++    previous_was_hyphen = value == '-';
++  }
++  return true;
++}
++
++bool IsValidRepositoryName(std::string_view name) {
++  if (name.empty() || name.size() > 100 || name == "." || name == "..") {
++    return false;
++  }
++  for (const char value : name) {
++    if (!IsAsciiAlphanumeric(value) && value != '-' && value != '.' &&
++        value != '_') {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool IsValidRepository(const GitHubRepository& repository) {
++  return IsValidOwner(repository.owner) &&
++         IsValidRepositoryName(repository.name);
++}
++
++bool HasUnsafeUrlCharacter(std::string_view url) {
++  for (const unsigned char value : url) {
++    // DEL is a control character too. Non-ASCII owner/repo bytes are separately
++    // rejected by their allowlists. URL suffixes are never used for requests.
++    if (value <= 0x20 || value == 0x7f || value == '\\') {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++std::string GitHubRepository::Key() const {
++  std::string result = owner + "/" + name;
++  for (char& value : result) {
++    value = ToLowerAscii(value);
++  }
++  return result;
++}
++
++std::string GitHubRepository::ApiUrl() const {
++  if (!IsValidRepository(*this)) {
++    return {};
++  }
++  return "https://api.github.com/repos/" + owner + "/" + name +
++         "/pulls?state=open&sort=updated&direction=desc&per_page=" +
++         std::to_string(kGitHubLiveFolderMaxPullRequests);
++}
++
++std::string GitHubRepository::PullUrl(int number) const {
++  if (number <= 0 || !IsValidRepository(*this)) {
++    return {};
++  }
++  return std::string(kWebOrigin) + owner + "/" + name + "/pull/" +
++         std::to_string(number);
++}
++
++bool GitHubRepository::operator==(const GitHubRepository& other) const {
++  return EqualIgnoringAsciiCase(owner, other.owner) &&
++         EqualIgnoringAsciiCase(name, other.name);
++}
++
++bool GitHubRepository::operator!=(const GitHubRepository& other) const {
++  return !(*this == other);
++}
++
++std::optional<GitHubRepository> ParseGitHubRepositoryUrl(std::string_view url) {
++  if (url.substr(0, kWebOrigin.size()) != kWebOrigin ||
++      HasUnsafeUrlCharacter(url)) {
++    return std::nullopt;
++  }
++  url.remove_prefix(kWebOrigin.size());
++  const std::size_t owner_end = url.find_first_of("/?#");
++  if (owner_end == std::string_view::npos || url[owner_end] != '/') {
++    return std::nullopt;
++  }
++  const std::string_view owner = url.substr(0, owner_end);
++  url.remove_prefix(owner_end + 1);
++  const std::string_view name = url.substr(0, url.find_first_of("/?#"));
++  if (!IsValidOwner(owner) || !IsValidRepositoryName(name)) {
++    return std::nullopt;
++  }
++  return GitHubRepository{std::string(owner), std::string(name)};
++}
++
++bool IsExpectedGitHubPullUrl(const GitHubRepository& repository,
++                             int number,
++                             std::string_view url) {
++  if (number <= 0 || !IsValidRepository(repository)) {
++    return false;
++  }
++  const auto parsed = ParseGitHubRepositoryUrl(url);
++  return parsed && *parsed == repository && url == parsed->PullUrl(number);
++}
++
++std::uint64_t GitHubLiveFolderRefreshGuard::Begin() {
++  if (stopped_) {
++    return 0;
++  }
++  if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
++    Stop();
++    return 0;
++  }
++  return ++generation_;
++}
++
++bool GitHubLiveFolderRefreshGuard::IsCurrent(std::uint64_t generation) const {
++  return !stopped_ && generation != 0 && generation == generation_;
++}
++
++void GitHubLiveFolderRefreshGuard::Stop() {
++  stopped_ = true;
++}
++
++}  // namespace helium
+--- /dev/null
++++ b/chrome/browser/ui/tabs/github_live_folder_model.h
+@@ -0,0 +1,65 @@
++// Copyright (C) 2026 The personal Helium fork contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#ifndef CHROME_BROWSER_UI_TABS_GITHUB_LIVE_FOLDER_MODEL_H_
++#define CHROME_BROWSER_UI_TABS_GITHUB_LIVE_FOLDER_MODEL_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace helium {
++
++inline constexpr std::size_t kGitHubLiveFolderMaxPullRequests = 10;
++
++// Repository identity is ASCII case-insensitive on GitHub. The spelling from
++// the original URL is retained for display and for generated URLs.
++struct GitHubRepository {
++  std::string owner;
++  std::string name;
++
++  std::string Key() const;
++  // These return an empty string for invalid repository fields. ApiUrl requests
++  // only the 10 most recently updated open pull requests, with no pagination.
++  std::string ApiUrl() const;
++  // Pull-request numbers must be in the positive range of int.
++  std::string PullUrl(int number) const;
++
++  bool operator==(const GitHubRepository& other) const;
++  bool operator!=(const GitHubRepository& other) const;
++};
++
++// Accepts only the literal https://github.com origin: no credentials, port,
++// escaped host, subdomain, or case/scheme normalization. Owner and repository
++// segments must be unescaped ASCII GitHub names. A path/query/fragment after
++// the repository is ignored. Raw whitespace, controls, and backslashes are
++// rejected throughout the URL to avoid browser/parser interpretation mismatch.
++std::optional<GitHubRepository> ParseGitHubRepositoryUrl(std::string_view url);
++
++// Accepts only https://github.com/{owner}/{repo}/pull/{number}, allowing ASCII
++// case differences in owner/repo only. Rejects padding, signs, suffixes,
++// queries, fragments, encoded names, and any other origin or path.
++bool IsExpectedGitHubPullUrl(const GitHubRepository& repository,
++                             int number,
++                             std::string_view url);
++
++// Sequence-affine guard for asynchronous refresh responses. Only the latest
++// nonzero generation is current. Stop permanently invalidates all generations;
++// subsequent Begin calls return 0 and cannot reactivate the guard. Overflow
++// also stops the guard rather than ever reusing a token.
++class GitHubLiveFolderRefreshGuard {
++ public:
++  std::uint64_t Begin();
++  bool IsCurrent(std::uint64_t generation) const;
++  void Stop();
++
++ private:
++  std::uint64_t generation_ = 0;
++  bool stopped_ = false;
++};
++
++}  // namespace helium
++
++#endif  // CHROME_BROWSER_UI_TABS_GITHUB_LIVE_FOLDER_MODEL_H_
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -313,6 +313,21 @@
+ // variants) to follow Apple Human Interface Guidelines (HIG), while other
+ // platforms use sentence case.
+ void TabMenuModel::Build(int index) {
++  if (tab_strip_->IsContextMenuCommandEnabled(
++          index, TabStripModel::CommandStopGitHubLiveFolder)) {
++    AddItem(TabStripModel::CommandRefreshGitHubLiveFolder,
++            u"Refresh GitHub live folder");
++    AddItem(TabStripModel::CommandStopGitHubLiveFolder,
++            u"Stop GitHub live folder (keep tabs)");
++    AddSeparator(ui::NORMAL_SEPARATOR);
++  } else if (tab_strip_->IsContextMenuCommandEnabled(
++                 index, TabStripModel::CommandCreateGitHubLiveFolder)) {
++    // The label makes opting in to repeated public-API requests explicit.
++    AddItem(TabStripModel::CommandCreateGitHubLiveFolder,
++            u"Create GitHub live folder (10 public PRs, every 5 min)");
++    AddSeparator(ui::NORMAL_SEPARATOR);
++  }
++
+   std::vector<int> indices;
+   if (tab_strip_->IsTabSelected(index)) {
+     const ui::ListSelectionModel::SelectedIndices sel =
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -61,6 +61,7 @@
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_bubble.h"
+ #include "chrome/browser/ui/tab_ui_helper.h"
+ #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/tabs/github_live_folder_controller.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_close_types_data.h"
+@@ -338,6 +339,7 @@
+ }
+ 
+ TabStripModel::~TabStripModel() {
++  github_live_folders_.reset();
+   for (auto& observer : observers_) {
+     observer.ModelDestroyed(TabStripModelObserver::ModelPasskey(), this);
+   }
+@@ -2737,6 +2739,17 @@
+   }
+ 
+   switch (command_id) {
++    case CommandCreateGitHubLiveFolder:
++      return github_live_folders_
++                 ? github_live_folders_->CanCreate(context_index)
++                 : helium::GitHubLiveFolderController::CanCreateForTab(
++                       this, context_index);
++    case CommandRefreshGitHubLiveFolder:
++      return github_live_folders_ &&
++             github_live_folders_->CanRefreshAt(context_index);
++    case CommandStopGitHubLiveFolder:
++      return github_live_folders_ &&
++             github_live_folders_->HasFolderAt(context_index);
+     case CommandNewTabToRight:
+     case CommandCloseTab:
+       return true;
+@@ -2882,6 +2895,25 @@
+     return;
+   }
+   switch (command_id) {
++    case CommandCreateGitHubLiveFolder:
++      if (IsContextMenuCommandEnabled(context_index, command_id)) {
++        if (!github_live_folders_) {
++          github_live_folders_ =
++              std::make_unique<helium::GitHubLiveFolderController>(this);
++        }
++        github_live_folders_->Create(context_index);
++      }
++      break;
++    case CommandRefreshGitHubLiveFolder:
++      if (github_live_folders_) {
++        github_live_folders_->RefreshAt(context_index);
++      }
++      break;
++    case CommandStopGitHubLiveFolder:
++      if (github_live_folders_) {
++        github_live_folders_->StopAt(context_index);
++      }
++      break;
+     case CommandNewTabToRight: {
+       base::UmaHistogramCounts1000(
+           "Tab.ContextMenu.NewTabToRight.SelectedTabsCount",
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -49,6 +49,10 @@
+ #if BUILDFLAG(IS_ANDROID)
+ #error This file should only be included on desktop.
+ #endif
++
++namespace helium {
++class GitHubLiveFolderController;
++}
+ 
+ class DraggingTabsSession;
+ class Profile;
+@@ -1505,6 +1509,9 @@
+   // The model for tab groups hosted within this TabStripModel.
+   std::unique_ptr<TabGroupModel> group_model_;
+ 
++  // Lazily created only by an explicit GitHub live-folder menu action.
++  std::unique_ptr<helium::GitHubLiveFolderController> github_live_folders_;
++
+   raw_ptr<TabStripModelDelegate> delegate_;
+ 
+   bool tab_strip_ui_was_set_ = false;
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -42,6 +42,10 @@
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  // Helium personal-fork commands, intentionally not UMA-logged.
++  CommandCreateGitHubLiveFolder,
++  CommandRefreshGitHubLiveFolder,
++  CommandStopGitHubLiveFolder,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
